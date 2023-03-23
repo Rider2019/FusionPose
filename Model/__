@@ -1,0 +1,61 @@
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.utils.data
+from torch.autograd import Variable
+import numpy as np
+import torch.nn.functional as F
+from .hrnet_32 import HigherResolutionNet
+from .pointnet_cls import Pnet_model
+
+
+class Fusion_Model(nn.Module):
+    def __init__(self,k=21*3,channel=256):
+        super(Fusion_Model, self).__init__()
+
+        # using pnet, keep the feature level and drop the last fc
+        self.pnet = Pnet_model(k,fusion = True).cuda()
+        pretrained = './exp/fintuning_openpose/best_model.t7'
+        state_dict = torch.load(pretrained,map_location='cpu')
+        pretrained_dict = {k: v for k, v in state_dict.items() if ('fc3' not in k.split('.')[0])}
+        state_dict.update(pretrained_dict)
+        self.pnet.load_state_dict(state_dict)
+
+
+        self.image_encode = HigherResolutionNet().cuda()
+
+        self.img_global = nn.Sequential(
+            nn.Conv2d(in_channels=32, out_channels=1, kernel_size=3, stride=2, padding=1, bias=True),
+            # nn.ReLU(inplace=True)
+        )
+        self.fc_img = nn.Sequential(
+            nn.Linear(channel*2, channel),
+            # nn.BatchNorm1d(channel),
+            nn.ReLU(inplace=True)
+        )
+        self.fusion_fc = nn.Linear(channel*2, k)
+        self.fusion_fc2 = nn.Linear(channel*2, int(k/3*2))
+
+    def forward(self,img,pc,device):
+        pc_feature = self.pnet(pc,device) # [8, 4, 256]
+        # print(img.shape)
+        B,T,W,H,C = img.shape
+        # img = img.permute(0,2,3,1,4).contiguous().view(B,W,H,C*T)
+        img_feature = torch.zeros((B,T,1,W//8,H//8)).to(device)
+        for i in range(T):
+            img_encode_feature = self.image_encode(img[:,i,...]) # [8, 32, 64, 32] B,C,H,W
+            # B, T, H/4, W/4 -- B,T,32,64,32
+            img_feature[:,i,...] = self.img_global(img_encode_feature)
+        
+        #[8, 4, 1, 32, 16]
+
+        img_feature = self.fc_img(img_feature.view(B,T,-1))
+
+
+        x1 = self.fusion_fc(torch.cat((pc_feature,img_feature),2))
+        x2 = self.fusion_fc2(torch.cat((pc_feature,img_feature),2))
+
+
+        return x1.view(B,T,-1),x2.view(B,T,-1)
+
+
